@@ -3,6 +3,7 @@
 Run directly with Python or through the repository's pytest suite.
 No GPU and no model download required.
 """
+import os
 import sys
 import types
 import unittest
@@ -62,7 +63,9 @@ class TestCaptureBudget(unittest.TestCase):
         self.assertEqual(len(caught), 1)
         msg = str(caught[0].message)
         self.assertIn("672 MiB", msg)
-        self.assertIn("8192 tokens x 28 layers x 1536", msg)
+        self.assertIn("0.082 MiB per token", msg)
+        self.assertIn("28 layers x 1536 x 2 bytes", msg)
+        self.assertIn("15488 total prompt tokens", msg)
 
     def test_qk_worker_uses_projection_widths(self):
         # (12 + 2) heads x 128 head_dim = 1792 per token, not hidden_size
@@ -81,6 +84,15 @@ class TestCaptureBudget(unittest.TestCase):
         # Higher utilization must report less free memory.
         self.assertIn("gpu_memory_utilization=0.70", sizes[0.70])
         self.assertIn("gpu_memory_utilization=0.90", sizes[0.90])
+
+    def test_margin_env_var_reduces_budget(self):
+        with _with_cuda(_FakeCuda()), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with patch.dict(os.environ, {"VLLM_HOOK_CAPTURE_MARGIN_MB": "400"}):
+                _log_capture_budget(_fake_config(), "hidden_states")
+        msg = str(caught[0].message)
+        self.assertIn("400 MiB held back", msg)
+        self.assertIn("10612 total prompt tokens", msg)
 
     def test_silent_without_cuda(self):
         cuda = _FakeCuda()

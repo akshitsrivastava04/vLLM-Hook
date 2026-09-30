@@ -74,13 +74,17 @@ def _trim_probes(probes: dict, key: str, expected_len: int) -> None:
 
 
 def _log_capture_budget(vllm_config, worker_type: str) -> None:
-    """Report per-step capture size against memory left outside vLLM's pool.
+    """Report the capture token budget against memory left outside vLLM's pool.
 
     vLLM profiles GPU memory before hooks install, so capture buffers are not
     part of the KV cache budget; they have to fit in whatever
     gpu_memory_utilization leaves free.
+
+    all_tokens capture accumulates over the whole generate() call, so the limit
+    is a total token count rather than a per-step cost.
     """
     import warnings
+    import os
     try:
         import torch
 
@@ -98,18 +102,28 @@ def _log_capture_budget(vllm_config, worker_type: str) -> None:
             width = (tc.num_attention_heads + tc.num_key_value_heads) * head_dim
         else:
             width = tc.hidden_size
-        per_step = tokens * layers * width * mc.dtype.itemsize
+        per_token = layers * width * mc.dtype.itemsize
+        per_step = tokens * per_token
         free = total * (1.0 - gmu)
+        margin = int(os.environ.get("VLLM_HOOK_CAPTURE_MARGIN_MB", "0")) * 1024**2
+        budget_tokens = int((free - margin) // per_token)
     except Exception:  # noqa: BLE001 - diagnostics must never block startup
         return
 
+    note = ""
+    if margin:
+        note = f" ({margin  / 1024**2:.0f} MiB held back by VLLM_HOOK_CAPTURE_MARGIN_MB)"
+
     warnings.warn(
         f"vLLM-Hook: capture buffers are outside vLLM's memory budget. "
-        f"One scheduler step at full width costs {per_step / 1024**2:.0f} MiB "
-        f"({tokens} tokens x {layers} layers x {width} x "
-        f"{mc.dtype.itemsize} bytes); gpu_memory_utilization={gmu:.2f} leaves "
-        f"about {free / 1024**2:.0f} MiB free. Capturing all_tokens over a whole "
-        f"generate() call costs more than one step.",
+        f"all_tokens capture costs {per_token / 1024**2:.3f} MiB per token "
+        f"({layers} layers x {width} x {mc.dtype.itemsize} bytes) and accumulates "
+        f"over the whole generate() call; gpu_memory_utilization={gmu:.2f} leaves "
+        f"about {free / 1024**2:.0f} MiB free{note}, so the budget is roughly "
+        f"{budget_tokens} total prompt tokens. One scheduler step at "
+        f"max_num_batched_tokens={tokens} costs {per_step / 1024**2:.0f} MiB, "
+        f"which is a floor, not the peak. To raise the ceiling: lower "
+        f"gpu_memory_utilization, capture fewer layers, or use last_token mode.",
         UserWarning,
     )
 
