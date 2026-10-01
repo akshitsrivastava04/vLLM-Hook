@@ -96,7 +96,8 @@ def _log_capture_budget(vllm_config, worker_type: str) -> None:
         tokens = vllm_config.scheduler_config.max_num_batched_tokens
         layers = tc.num_hidden_layers
         gmu = vllm_config.cache_config.gpu_memory_utilization
-        total = torch.cuda.get_device_properties(0).total_memory
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        name = torch.cuda.get_device_name()
         if worker_type == "qk":
             head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
             width = (tc.num_attention_heads + tc.num_key_value_heads) * head_dim
@@ -105,27 +106,52 @@ def _log_capture_budget(vllm_config, worker_type: str) -> None:
         per_token = layers * width * mc.dtype.itemsize
         per_step = tokens * per_token
         free = total * (1.0 - gmu)
-        margin = int(os.environ.get("VLLM_HOOK_CAPTURE_MARGIN_MB", "0")) * 1024**2
-        budget_tokens = int((free - margin) // per_token)
+        device_free, _ = torch.cuda.mem_get_info()
+        margin = total - device_free
+        override = os.environ.get("VLLM_HOOK_CAPTURE_MARGIN_MB")
+        if override is not None:
+            margin = int(override) * 1024 **2
+
+        budget_tokens = max(0, int((free - margin) // per_token))
+        want_batch = int(os.environ.get("VLLM_HOOK_EXPECT_BATCH", "0"))
+        want_prompt = int(os.environ.get("VLLM_HOOK_EXPECT_PROMPT_TOKENS", "0"))
+        declared = want_batch * want_prompt
     except Exception:  # noqa: BLE001 - diagnostics must never block startup
         return
 
     note = ""
     if margin:
-        note = f" ({margin  / 1024**2:.0f} MiB held back by VLLM_HOOK_CAPTURE_MARGIN_MB)"
+        note = f" less {margin  / 1024**2:.0f} MiB already in use on the device"
 
-    warnings.warn(
-        f"vLLM-Hook: capture buffers are outside vLLM's memory budget. "
-        f"all_tokens capture costs {per_token / 1024**2:.3f} MiB per token "
-        f"({layers} layers x {width} x {mc.dtype.itemsize} bytes) and accumulates "
-        f"over the whole generate() call; gpu_memory_utilization={gmu:.2f} leaves "
-        f"about {free / 1024**2:.0f} MiB free{note}, so the budget is roughly "
-        f"{budget_tokens} total prompt tokens. One scheduler step at "
-        f"max_num_batched_tokens={tokens} costs {per_step / 1024**2:.0f} MiB, "
-        f"which is a floor, not the peak. To raise the ceiling: lower "
-        f"gpu_memory_utilization, capture fewer layers, or use last_token mode.",
-        UserWarning,
+    where = (
+        f"{total / 1024**2:.0f} MiB total, gpu_memory_utilization={gmu:.2f} leaves "
+        f"{free / 1024**2:.0f} MiB outside vLLM's pool{note}, so the capture budget "
+        f"is {budget_tokens} prompt tokens at {per_token / 1024**2:.3f} MiB/token "
+        f"({layers} layers x {width} x {mc.dtype.itemsize} bytes)"
     )
+
+    if declared and declared > budget_tokens:
+        verdict = (
+            f"WILL OOM: the declared {want_batch} x {want_prompt} = {declared} tokens "
+            f"need {declared * per_token / 1024**2:.0f} MiB, "
+            f"{(declared - budget_tokens) * per_token / 1024**2:.0f} MiB over. Lower "
+            f"gpu_memory_utilization, reduce the batch, capture fewer layers, or use "
+            f"last_token mode."
+            )
+    elif per_step > free - margin:
+        verdict = (
+            f"WILL OOM: one scheduler step at max_num_batched_tokens={tokens} needs "
+            f"{per_step / 1024**2:.0f} MiB and does not fit at any batch size. Lower "
+            f"gpu_memory_utilization or capture fewer layers."
+        )
+    else:
+        verdict = (
+            "all_tokens capture accumulates over the whole generate() call; set "
+            "VLLM_HOOK_EXPECT_BATCH and VLLM_HOOK_EXPECT_PROMPT_TOKENS for a "
+            "pre-flight OOM check."
+        )
+
+    warnings.warn(f"vLLM-Hook capture on {name} — {where}. {verdict}", UserWarning)
 
 
 def _patched_create_engine_config(self, *args, **kwargs):

@@ -11,7 +11,7 @@ import warnings
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "vllm_hook_plugins"))
 
 from vllm_hook_plugins._hook_plugin import _log_capture_budget, _looks_like_oom
 
@@ -37,10 +37,17 @@ def _fake_config(layers=28, hidden=1536, heads=12, kv_heads=2, head_dim=128,
 class _FakeCuda:
     """Stands in for torch.cuda with a fixed device size and free amount."""
     def __init__(self, total=5.64 * 1024**3, free=None):
-        self._total, self._free = total, free
+        self._total = total
+        self._free = total if free is None else free
 
     def is_available(self):
         return True
+
+    def current_device(self):
+        return 0
+
+    def get_device_name(self, _index=None):
+        return "FakeGPU"
 
     def get_device_properties(self, _index):
         return types.SimpleNamespace(total_memory=self._total)
@@ -55,6 +62,11 @@ def _with_cuda(cuda):
 
 
 class TestCaptureBudget(unittest.TestCase):
+    def setUp(self):
+        for k in ("VLLM_HOOK_CAPTURE_MARGIN_MB", "VLLM_HOOK_EXPECT_BATCH",
+                  "VLLM_HOOK_EXPECT_PROMPT_TOKENS"):
+            os.environ.pop(k, None)
+
     def test_hidden_states_arithmetic(self):
         # 8192 tokens x 28 layers x 1536 x 2 bytes = 672 MiB
         with _with_cuda(_FakeCuda()), warnings.catch_warnings(record=True) as caught:
@@ -62,10 +74,10 @@ class TestCaptureBudget(unittest.TestCase):
             _log_capture_budget(_fake_config(), "hidden_states")
         self.assertEqual(len(caught), 1)
         msg = str(caught[0].message)
-        self.assertIn("672 MiB", msg)
-        self.assertIn("0.082 MiB per token", msg)
+        self.assertIn("0.082 MiB/token", msg)
         self.assertIn("28 layers x 1536 x 2 bytes", msg)
-        self.assertIn("15488 total prompt tokens", msg)
+        self.assertIn("15488 prompt tokens", msg)
+        self.assertIn("FakeGPU", msg)
 
     def test_qk_worker_uses_projection_widths(self):
         # (12 + 2) heads x 128 head_dim = 1792 per token, not hidden_size
@@ -91,8 +103,8 @@ class TestCaptureBudget(unittest.TestCase):
             with patch.dict(os.environ, {"VLLM_HOOK_CAPTURE_MARGIN_MB": "400"}):
                 _log_capture_budget(_fake_config(), "hidden_states")
         msg = str(caught[0].message)
-        self.assertIn("400 MiB held back", msg)
-        self.assertIn("10612 total prompt tokens", msg)
+        self.assertIn("less 400 MiB already in use", msg)
+        self.assertIn("10612 prompt tokens", msg)
 
     def test_silent_without_cuda(self):
         cuda = _FakeCuda()
@@ -109,6 +121,31 @@ class TestCaptureBudget(unittest.TestCase):
             _log_capture_budget(types.SimpleNamespace(), "hidden_states")
         self.assertEqual(caught, [])
 
+    def test_margin_is_measured_from_device(self):
+        cuda = _FakeCuda(free=5.64 * 1024**3 - 102 * 1024**2)
+        with _with_cuda(cuda), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _log_capture_budget(_fake_config(), "hidden_states")
+        msg = str(caught[0].message)
+        self.assertIn("less 102 MiB already in use", msg)
+        self.assertIn("14245 prompt tokens", msg)
+
+    def test_declared_workload_over_budget_warns_oom(self):
+        with _with_cuda(_FakeCuda()), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with patch.dict(os.environ, {"VLLM_HOOK_EXPECT_BATCH": "32", "VLLM_HOOK_EXPECT_PROMPT_TOKENS": "512"}):
+                _log_capture_budget(_fake_config(), "hidden_states")
+        msg = str(caught[0].message)
+        self.assertIn("WILL OOM", msg)
+        self.assertIn("32 x 512 = 16384 tokens need 1344 MiB", msg)
+
+    def test_single_step_too_large_warns_oom(self):
+        with _with_cuda(_FakeCuda()), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _log_capture_budget(_fake_config(gmu=0.90), "hidden_states")
+        msg = str(caught[0].message)
+        self.assertIn("WILL OOM", msg)
+        self.assertIn("does not fit at any batch size", msg)
 
 class TestLooksLikeOom(unittest.TestCase):
     def test_explicit_oom_message(self):
